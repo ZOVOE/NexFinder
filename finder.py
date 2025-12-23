@@ -93,20 +93,69 @@ bin_data = load_bin_data()
 # Execute Query | Directly Access 
 def execute_sql(query, params=None):
     conn = psycopg2.connect(conn_string)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+    finally:
+        conn.close()
 #Fetching SQL
 def fetch_sql(query, params=None):
     conn = psycopg2.connect(conn_string)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+def ensure_db_schema():
+    """
+    Create required tables/columns if missing.
+
+    This fixes errors like: psycopg2.errors.UndefinedTable: relation "users" does not exist
+    """
+    conn = psycopg2.connect(conn_string)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        userid BIGINT PRIMARY KEY,
+                        first_name TEXT,
+                        premium BOOLEAN NOT NULL DEFAULT FALSE,
+                        vip BOOLEAN NOT NULL DEFAULT FALSE,
+                        admin BOOLEAN NOT NULL DEFAULT FALSE,
+                        owner BOOLEAN NOT NULL DEFAULT FALSE,
+                        special BOOLEAN NOT NULL DEFAULT FALSE,
+                        prefer BOOLEAN NOT NULL DEFAULT FALSE,
+                        antispam_fu BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id BIGINT PRIMARY KEY REFERENCES users(userid) ON DELETE CASCADE,
+                        flag_match BOOLEAN NOT NULL DEFAULT FALSE,
+                        vendor_match BOOLEAN NOT NULL DEFAULT FALSE,
+                        type_match BOOLEAN NOT NULL DEFAULT FALSE,
+                        level_match BOOLEAN NOT NULL DEFAULT FALSE
+                    );
+                    """
+                )
+    finally:
+        conn.close()
+
+# Ensure DB schema exists at startup
+try:
+    ensure_db_schema()
+except Exception as e:
+    # Don't crash the whole bot on startup if DB is down;
+    # handlers will surface the error when used.
+    print(f"[DB] Schema check failed: {e}")
 def search_databin(bank_name, filter_criteria=None):
     """
     Search merged local BIN dataset for exact bank_name match.
@@ -402,19 +451,20 @@ def bin_lookup_pro(bin_number):
 
 
 def get_user_role(user_id):
-
-    user_roles = fetch_sql("SELECT USERID,  Premium, VIP, Admin, Owner FROM users WHERE USERID = %s", (user_id,))
-
- 
+    user_roles = fetch_sql(
+        "SELECT premium, vip, admin, owner FROM users WHERE userid = %s",
+        (user_id,),
+    )
 
     if user_roles:
-        if user_roles[3]:  # Owner
+        premium, vip, admin, owner = user_roles
+        if owner:
             return "Owner"
-        elif user_roles[2]:  # Admin
+        if admin:
             return "Admin"
-        elif user_roles[1]:  # VIP
+        if vip:
             return "VIP"
-        elif user_roles[0]:  # Premium
+        if premium:
             return "Premium"
     return "Free User"
 
@@ -447,7 +497,7 @@ def update_user_setting(user_id, setting_name, value):
 @bot.on_message(filters.text & ~filters.command("register") & ~filters.command("info"))
 async def default_handler(client, message):
     user_id = message.from_user.id
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -688,14 +738,14 @@ async def register_handler(client, message):
     user_first_name = message.from_user.first_name
 
     # Check if the user is already registered
-    existing_user = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    existing_user = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
     if existing_user:
         return await message.reply_text("🚫 You are already registered.")
 
     # Register the new user in the users table
     execute_sql(
-        "INSERT INTO users (USERID,  Premium, VIP, Admin, Owner) VALUES (%s, %s, FALSE, FALSE, FALSE, FALSE);",
-        (user_id, user_first_name)
+        "INSERT INTO users (userid, first_name) VALUES (%s, %s);",
+        (user_id, user_first_name),
     )
 
     # Initialize user settings in the user_settings table with all False
@@ -712,7 +762,10 @@ async def register_handler(client, message):
 @bot.on_message(filters.command("info"))
 async def info_handler(client, message):
     user_id = message.from_user.id
-    users = fetch_sql("SELECT USERID,  Premium, VIP, Admin, Owner FROM users WHERE USERID = %s", (user_id,))
+    users = fetch_sql(
+        "SELECT userid, first_name, premium, vip, admin, owner FROM users WHERE userid = %s",
+        (user_id,),
+    )
 
     if users:
         _, first_name, premium, vip, admin, owner = users
@@ -984,7 +1037,7 @@ def toggle_or_close_setting(bot_client, query: CallbackQuery):
 async def sbin_command(client, message):
     user_id = message.from_user.id
     user_role = get_user_role(user_id)
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -1031,7 +1084,7 @@ async def abs_command(client, message):
     user_id = message.from_user.id
     user_role = get_user_role(user_id)
     
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -1094,7 +1147,7 @@ async def abs_command(client, message):
 async def bbs_command(client, message):
     user_id = message.from_user.id
     user_role = get_user_role(user_id)
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
