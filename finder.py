@@ -8,7 +8,7 @@ import psycopg2 # Installing Directly psycopg2 Giving Error Instead Try pip3 ins
 from pyrogram import Client, filters
 import pandas as pd
 import re
-from threading import Event, Thread
+from threading import Event, Thread, Lock
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import time 
 import signal
@@ -36,6 +36,10 @@ user_settings = {}
 #Client Connection PersiaTools | Token Owner @ZOVOE
 bot = Client("PersiaTools", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app = Client("appx", api_id=API_ID, api_hash=API_HASH)
+
+# Active /finder searches (chat_id, owner_user_id) -> stop Event
+ACTIVE_SEARCHES: dict[tuple[int, int], Event] = {}
+ACTIVE_SEARCHES_LOCK = Lock()
 
 
 # Files: local BIN databases (supports multiple CSVs)
@@ -836,6 +840,10 @@ def process_request(bot_client, message, bin_digit, limit):
     start_time = time.time()
     stop_event = Event()
 
+    search_key = (int(message.chat.id), int(message.from_user.id))
+    with ACTIVE_SEARCHES_LOCK:
+        ACTIVE_SEARCHES[search_key] = stop_event
+
     def search_messages():
         nonlocal total_found
         for dialog in app.get_dialogs():  # Use the app client for getting dialogs
@@ -893,14 +901,18 @@ Elapsed Time: {int(elapsed_time)}s
             if limit and total_found >= limit:
                 break
 
-    search_thread = Thread(target=search_messages)
-    search_thread.start()
+    try:
+        search_thread = Thread(target=search_messages)
+        search_thread.start()
 
-    update_thread = Thread(target=update_status)
-    update_thread.start()
+        update_thread = Thread(target=update_status)
+        update_thread.start()
 
-    search_thread.join()
-    update_thread.join()
+        search_thread.join()
+        update_thread.join()
+    finally:
+        with ACTIVE_SEARCHES_LOCK:
+            ACTIVE_SEARCHES.pop(search_key, None)
 
     finish_reason = "Time Limit Reached" if time.time() - start_time > 300 else "Stopped by User"
 
@@ -924,13 +936,28 @@ FINISHED. Reason: {finish_reason}
         bot_client.send_message(message.chat.id, f"No matches found for BIN {bin_digit}.")
 
 def stop_search(client, callback_query):
-    user_id = int(callback_query.data.split('_')[2])
-    if callback_query.from_user.id == user_id or callback_query.from_user.id in admin_ids:
-        stop_event.set()
-        callback_query.message.edit_text("Search stopped.")
-        client.answer_callback_query(callback_query.id, "Search stopped.")
-    else:
-        client.answer_callback_query(callback_query.id, "You are not authorized to stop this search.", show_alert=True)
+    parts = callback_query.data.split('_')
+    chat_id = int(parts[1])
+    target_user_id = int(parts[2])
+
+    if callback_query.from_user.id != target_user_id and callback_query.from_user.id not in admin_ids:
+        client.answer_callback_query(
+            callback_query.id,
+            "You are not authorized to stop this search.",
+            show_alert=True,
+        )
+        return
+
+    with ACTIVE_SEARCHES_LOCK:
+        event = ACTIVE_SEARCHES.get((chat_id, target_user_id))
+
+    if not event:
+        client.answer_callback_query(callback_query.id, "No active search to stop.", show_alert=True)
+        return
+
+    event.set()
+    callback_query.message.edit_text("Search stopped.")
+    client.answer_callback_query(callback_query.id, "Search stopped.")
 
 @bot.on_callback_query(filters.regex(r"^stop_\d+_\d+$"))
 def on_stop_button(bot_client, callback_query):
@@ -1049,8 +1076,15 @@ async def sbin_command(client, message):
         )
         return
 
-    bin_number = message.text.split()[1]
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/sbin <BIN>`")
+        return
+
+    bin_number = message.command[1]
     bin_info = bin_lookup(bin_number)
+    if not bin_info:
+        await message.reply_text("🚫 BIN not found in local database.")
+        return
     bank_name = bin_info['bank_name']
 
     matches = search_databin(bank_name)
@@ -1096,8 +1130,15 @@ async def abs_command(client, message):
         )
         return
 
-    bin_number = message.text.split()[1]
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/abs <BIN>`")
+        return
+
+    bin_number = message.command[1]
     bin_info = bin_lookup(bin_number)
+    if not bin_info:
+        await message.reply_text("🚫 BIN not found in local database.")
+        return
     settings = get_user_settings(user_id)
 
     setting_value_map = {
@@ -1159,7 +1200,11 @@ async def bbs_command(client, message):
         )
         return
 
-    bank_name_input = " ".join(message.text.split()[1:])
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/bbs <bank name>`")
+        return
+
+    bank_name_input = " ".join(message.command[1:])
     matches = search_databin_by_bank_name(bank_name_input)
 
     if len(matches) > 5:
@@ -1428,7 +1473,7 @@ async def binpro_handler(client, message):
 @bot.on_message(filters.command("bank"))
 async def bank_handler(client, message):
     user_id = message.from_user.id
-    query = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else None
+    query = " ".join(message.command[1:]) if len(message.command) > 1 else None
     
     if not query:
         await message.reply_text("❓ *Please provide a bank name to search.*")
