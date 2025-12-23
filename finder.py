@@ -1,5 +1,8 @@
 import asyncio
 import os
+import sys
+import random
+import string
 import psutil
 import psycopg2 # Installing Directly psycopg2 Giving Error Instead Try pip3 install psycopg2-binary
 from pyrogram import Client, filters
@@ -35,8 +38,55 @@ bot = Client("PersiaTools", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 app = Client("appx", api_id=API_ID, api_hash=API_HASH)
 
 
-#Files 
-bin_data = pd.read_csv('databin.csv') #Bin Databases - Contact @ZOVOE Get It
+# Files: local BIN databases (supports multiple CSVs)
+BIN_CSV_FILES = ("databin.csv", "databin2.csv")
+
+def load_bin_data(csv_files=BIN_CSV_FILES) -> pd.DataFrame:
+    """
+    Load and merge BIN CSV databases.
+
+    Expected columns:
+      number,country,flag,vendor,type,level,bank_name
+    """
+    expected_cols = ["number", "country", "flag", "vendor", "type", "level", "bank_name"]
+    frames: list[pd.DataFrame] = []
+
+    for path in csv_files:
+        if not os.path.exists(path):
+            continue
+
+        df = pd.read_csv(path, keep_default_na=False)
+
+        # Keep only known columns if present; ignore extra columns safely.
+        if not set(expected_cols).issubset(df.columns):
+            # Best-effort: normalize column names and retry
+            df.columns = [str(c).strip().lower() for c in df.columns]
+        if set(expected_cols).issubset(df.columns):
+            df = df[expected_cols]
+        else:
+            # If schema is unexpected, skip this file instead of crashing the bot.
+            continue
+
+        # Drop blank rows (databin2.csv sometimes contains an empty line).
+        df["number"] = df["number"].astype(str).str.strip()
+        df = df[df["number"].ne("")]
+
+        # Normalize number to integer-like for fast lookups.
+        df["number"] = pd.to_numeric(df["number"], errors="coerce").astype("Int64")
+        df = df.dropna(subset=["number"])
+
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=expected_cols)
+
+    combined = pd.concat(frames, ignore_index=True)
+    # De-dupe across sources; keep first occurrence.
+    combined = combined.drop_duplicates(subset=expected_cols, keep="first")
+    return combined
+
+# Load once at startup
+bin_data = load_bin_data()
 
 
 #Functions 
@@ -58,22 +108,27 @@ def fetch_sql(query, params=None):
     conn.close()
     return result
 def search_databin(bank_name, filter_criteria=None):
-    matches = []
-    with open('databin.csv', mode='r') as file:
-        csv_reader = csv.DictReader(file)
-        for row in csv_reader:
-            if row['bank_name'] == bank_name:
-                if filter_criteria:
-                    match = True
-                    for key, value in filter_criteria.items():
-                        if row[key] != value:
-                            match = False
-                            break
-                    if match:
-                        matches.append(row)
-                else:
-                    matches.append(row)
-    return matches
+    """
+    Search merged local BIN dataset for exact bank_name match.
+    """
+    if bin_data.empty:
+        return []
+
+    df = bin_data[bin_data["bank_name"] == bank_name]
+
+    if filter_criteria:
+        for key, value in filter_criteria.items():
+            if key not in df.columns:
+                continue
+            df = df[df[key] == value]
+
+    # Convert to plain dict rows (keep behavior similar to old code).
+    out = df.to_dict(orient="records")
+    for row in out:
+        # Ensure number is serializable/consistent with old csv reader strings.
+        if "number" in row and row["number"] is not None:
+            row["number"] = int(row["number"])
+    return out
 def save_matches_to_file(matches, bank_name):
     hash_object = hashlib.md5(bank_name.encode())
     file_name = f"{hash_object.hexdigest()}_BIN.txt"
@@ -89,12 +144,23 @@ def save_matches_to_file(matches, bank_name):
             )
     return file_name
 def search_databin_by_bank_name(bank_name):
-    matches = []
-    with open('databin.csv', mode='r') as file:
-        csv_reader = csv.DictReader(file)
-        for row in csv_reader:
-            if re.search(bank_name, row['bank_name'], re.IGNORECASE):
-                matches.append(row)
+    """
+    Search merged local BIN dataset by bank name regex (case-insensitive).
+    """
+    if bin_data.empty:
+        return []
+
+    pattern = re.compile(bank_name, re.IGNORECASE)
+    matches: list[dict] = []
+
+    # Iterate rows for regex matching (pandas .str.contains can choke on bad regex)
+    for row in bin_data.to_dict(orient="records"):
+        bank = str(row.get("bank_name", ""))
+        if pattern.search(bank):
+            if "number" in row and row["number"] is not None:
+                row["number"] = int(row["number"])
+            matches.append(row)
+
     return matches
 def format_message(matches):
     message = ""
@@ -607,7 +673,7 @@ async def bin_handler(client, message):
 
     # Create response message
     response_text = (
-        f"**BIN INFO | Database1 ✅**\n\n"
+        f"**BIN INFO | Local CSV (databin + databin2) ✅**\n\n"
         f"**Bank**: **{bin_info['bank_name']}** - **{bin_info['country']}{bin_info['flag']}**\n"
         f"**Info**: **{bin_info['vendor']}** **{bin_info['type']}** - **{bin_info['level']}**\n"
         f"**User**: <a href='tg://user?id={user_id}'>{user_first_name}</a> {role}\n"
