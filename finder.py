@@ -1491,15 +1491,18 @@ async def bank_handler(client, message):
     user_settings[user_id] = {
         'step': 'bank',
         'banks': banks,
+        'tokens': {},
         'time': datetime.now() + timedelta(minutes=30)
     }
     
     if len(banks) == 0:
         await message.reply_text(f"🚫 *No results found for* `{query}`")
     elif len(banks) <= 6:
-        inline_buttons = [
-            [InlineKeyboardButton(f"🏦 {bank}", callback_data=f"bank_{generate_random_string()}")] for bank in banks
-        ]
+        inline_buttons = []
+        for bank in banks:
+            token = generate_random_string(12)
+            user_settings[user_id]['tokens'][token] = {'bank': bank}
+            inline_buttons.append([InlineKeyboardButton(f"🏦 {bank}", callback_data=f"bank_{token}")])
         await message.reply_text(
             f"🔍 *Select the bank you're interested in:*",
             reply_markup=InlineKeyboardMarkup(inline_buttons)
@@ -1524,24 +1527,33 @@ async def bank_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    # Since the callback data is random, we'll retrieve the bank name from user settings
-    bank_name = next(bank for bank in user_settings[user_id]['banks'] if f"bank_{callback_query.data.split('_')[1]}" in callback_query.data)
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'bank' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    bank_name = token_data['bank']
     
     # Update user settings
     user_settings[user_id].update({
         'step': 'country',
         'selected_bank': bank_name
     })
+    user_settings[user_id]['tokens'] = {}
     
     results = search_databin_by_bank_name(bank_name)
     
     # Remove duplicate countries
     countries = remove_duplicates(results, key=lambda x: x['country'])
     
-    country_buttons = [
-        [InlineKeyboardButton(f"{row['flag']} {row['country']}", callback_data=f"country_{generate_random_string()}_{row['country']}_{bank_name}")]
-        for row in countries
-    ]
+    country_buttons = []
+    for row in countries:
+        token2 = generate_random_string(12)
+        user_settings[user_id]['tokens'][token2] = {
+            'country': row.get('country', ''),
+            'flag': row.get('flag', ''),
+        }
+        country_buttons.append([InlineKeyboardButton(f"{row.get('flag', '')} {row.get('country', '')}", callback_data=f"country_{token2}")])
     
     await callback_query.message.edit_text(
         f"🏦 *Bank:* `{bank_name}`\n🌍 *Select a country:*",
@@ -1556,25 +1568,34 @@ async def country_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    data = callback_query.data.split("_")
-    country = data[2]
-    bank_name = data[3]
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'country' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    country = token_data['country']
+    bank_name = user_settings[user_id].get('selected_bank')
+    if not bank_name:
+        await callback_query.answer("❌ Missing bank selection. Please start again.", show_alert=True)
+        return
     
     # Update user settings
     user_settings[user_id].update({
         'step': 'type',
         'selected_country': country
     })
+    user_settings[user_id]['tokens'] = {}
     
     results = search_databin_by_bank_name(bank_name)
     
     # Remove duplicate types
     types = remove_duplicates([row for row in results if row['country'] == country], key=lambda x: x['type'])
     
-    type_buttons = [
-        [InlineKeyboardButton(f"⚔️ {row['type']}", callback_data=f"type_{user_id}_{generate_random_string()}_{row['type']}_{bank_name}_{country}")]
-        for row in types
-    ]
+    type_buttons = []
+    for row in types:
+        token2 = generate_random_string(12)
+        user_settings[user_id]['tokens'][token2] = {'type': row.get('type', '')}
+        type_buttons.append([InlineKeyboardButton(f"⚔️ {row.get('type', '')}", callback_data=f"type_{token2}")])
     
     await callback_query.message.edit_text(
         f"🏦 *Bank:* `{bank_name}`\n🌍 *Country:* `{country}`\n⚙️ *Select a type:*",
@@ -1590,26 +1611,35 @@ async def type_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    data = callback_query.data.split("_")
-    type_name = data[3]
-    bank_name = data[4]
-    country = data[5]
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'type' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    type_name = token_data['type']
+    bank_name = user_settings[user_id].get('selected_bank')
+    country = user_settings[user_id].get('selected_country')
+    if not bank_name or not country:
+        await callback_query.answer("❌ Missing selection context. Please start again.", show_alert=True)
+        return
     
     # Update user settings
     user_settings[user_id].update({
         'step': 'vendor',
         'selected_type': type_name
     })
+    user_settings[user_id]['tokens'] = {}
     
     results = search_databin_by_bank_name(bank_name)
     
     # Remove duplicate vendors
     vendors = remove_duplicates([row for row in results if row['country'] == country and row['type'] == type_name], key=lambda x: x['vendor'])
     
-    vendor_buttons = [
-        [InlineKeyboardButton(f"💳 {vendor}", callback_data=f"vendor_{user_id}_{generate_random_string()}_{vendor}_{bank_name}_{country}_{type_name}")]
-        for vendor in vendors
-    ]
+    vendor_buttons = []
+    for vendor in vendors:
+        token2 = generate_random_string(12)
+        user_settings[user_id]['tokens'][token2] = {'vendor': vendor}
+        vendor_buttons.append([InlineKeyboardButton(f"💳 {vendor}", callback_data=f"vendor_{token2}")])
     
     await callback_query.message.edit_text(
         f"🏦 *Bank:* `{bank_name}`\n🌍 *Country:* `{country}`\n⚙️ *Type:* `{type_name}`\n💳 *Select a vendor:*",
@@ -1626,11 +1656,18 @@ async def vendor_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    data = callback_query.data.split("_")
-    vendor = data[3]
-    bank_name = data[4]
-    country = data[5]
-    type_name = data[6]
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'vendor' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    vendor = token_data['vendor']
+    bank_name = user_settings[user_id].get('selected_bank')
+    country = user_settings[user_id].get('selected_country')
+    type_name = user_settings[user_id].get('selected_type')
+    if not bank_name or not country or not type_name:
+        await callback_query.answer("❌ Missing selection context. Please start again.", show_alert=True)
+        return
     
     results = [row for row in search_databin_by_bank_name(bank_name) if row['country'] == country and row['type'] == type_name and row['vendor'] == vendor]
     
