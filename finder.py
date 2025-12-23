@@ -1,11 +1,14 @@
 import asyncio
 import os
+import sys
+import random
+import string
 import psutil
 import psycopg2 # Installing Directly psycopg2 Giving Error Instead Try pip3 install psycopg2-binary
 from pyrogram import Client, filters
 import pandas as pd
 import re
-from threading import Event, Thread
+from threading import Event, Thread, Lock
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import time 
 import signal
@@ -34,46 +37,151 @@ user_settings = {}
 bot = Client("PersiaTools", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app = Client("appx", api_id=API_ID, api_hash=API_HASH)
 
+# Active /finder searches (chat_id, owner_user_id) -> stop Event
+ACTIVE_SEARCHES: dict[tuple[int, int], Event] = {}
+ACTIVE_SEARCHES_LOCK = Lock()
 
-#Files 
-bin_data = pd.read_csv('databin.csv') #Bin Databases - Contact @ZOVOE Get It
+
+# Files: local BIN databases (supports multiple CSVs)
+BIN_CSV_FILES = ("databin.csv", "databin2.csv")
+
+def load_bin_data(csv_files=BIN_CSV_FILES) -> pd.DataFrame:
+    """
+    Load and merge BIN CSV databases.
+
+    Expected columns:
+      number,country,flag,vendor,type,level,bank_name
+    """
+    expected_cols = ["number", "country", "flag", "vendor", "type", "level", "bank_name"]
+    frames: list[pd.DataFrame] = []
+
+    for path in csv_files:
+        if not os.path.exists(path):
+            continue
+
+        df = pd.read_csv(path, keep_default_na=False)
+
+        # Keep only known columns if present; ignore extra columns safely.
+        if not set(expected_cols).issubset(df.columns):
+            # Best-effort: normalize column names and retry
+            df.columns = [str(c).strip().lower() for c in df.columns]
+        if set(expected_cols).issubset(df.columns):
+            df = df[expected_cols]
+        else:
+            # If schema is unexpected, skip this file instead of crashing the bot.
+            continue
+
+        # Drop blank rows (databin2.csv sometimes contains an empty line).
+        df["number"] = df["number"].astype(str).str.strip()
+        df = df[df["number"].ne("")]
+
+        # Normalize number to integer-like for fast lookups.
+        df["number"] = pd.to_numeric(df["number"], errors="coerce").astype("Int64")
+        df = df.dropna(subset=["number"])
+
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=expected_cols)
+
+    combined = pd.concat(frames, ignore_index=True)
+    # De-dupe across sources; keep first occurrence.
+    combined = combined.drop_duplicates(subset=expected_cols, keep="first")
+    return combined
+
+# Load once at startup
+bin_data = load_bin_data()
 
 
 #Functions 
 # Execute Query | Directly Access 
 def execute_sql(query, params=None):
     conn = psycopg2.connect(conn_string)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+    finally:
+        conn.close()
 #Fetching SQL
 def fetch_sql(query, params=None):
     conn = psycopg2.connect(conn_string)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+def ensure_db_schema():
+    """
+    Create required tables/columns if missing.
+
+    This fixes errors like: psycopg2.errors.UndefinedTable: relation "users" does not exist
+    """
+    conn = psycopg2.connect(conn_string)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        userid BIGINT PRIMARY KEY,
+                        first_name TEXT,
+                        premium BOOLEAN NOT NULL DEFAULT FALSE,
+                        vip BOOLEAN NOT NULL DEFAULT FALSE,
+                        admin BOOLEAN NOT NULL DEFAULT FALSE,
+                        owner BOOLEAN NOT NULL DEFAULT FALSE,
+                        special BOOLEAN NOT NULL DEFAULT FALSE,
+                        prefer BOOLEAN NOT NULL DEFAULT FALSE,
+                        antispam_fu BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id BIGINT PRIMARY KEY REFERENCES users(userid) ON DELETE CASCADE,
+                        flag_match BOOLEAN NOT NULL DEFAULT FALSE,
+                        vendor_match BOOLEAN NOT NULL DEFAULT FALSE,
+                        type_match BOOLEAN NOT NULL DEFAULT FALSE,
+                        level_match BOOLEAN NOT NULL DEFAULT FALSE
+                    );
+                    """
+                )
+    finally:
+        conn.close()
+
+# Ensure DB schema exists at startup
+try:
+    ensure_db_schema()
+except Exception as e:
+    # Don't crash the whole bot on startup if DB is down;
+    # handlers will surface the error when used.
+    print(f"[DB] Schema check failed: {e}")
 def search_databin(bank_name, filter_criteria=None):
-    matches = []
-    with open('databin.csv', mode='r') as file:
-        csv_reader = csv.DictReader(file)
-        for row in csv_reader:
-            if row['bank_name'] == bank_name:
-                if filter_criteria:
-                    match = True
-                    for key, value in filter_criteria.items():
-                        if row[key] != value:
-                            match = False
-                            break
-                    if match:
-                        matches.append(row)
-                else:
-                    matches.append(row)
-    return matches
+    """
+    Search merged local BIN dataset for exact bank_name match.
+    """
+    if bin_data.empty:
+        return []
+
+    df = bin_data[bin_data["bank_name"] == bank_name]
+
+    if filter_criteria:
+        for key, value in filter_criteria.items():
+            if key not in df.columns:
+                continue
+            df = df[df[key] == value]
+
+    # Convert to plain dict rows (keep behavior similar to old code).
+    out = df.to_dict(orient="records")
+    for row in out:
+        # Ensure number is serializable/consistent with old csv reader strings.
+        if "number" in row and row["number"] is not None:
+            row["number"] = int(row["number"])
+    return out
 def save_matches_to_file(matches, bank_name):
     hash_object = hashlib.md5(bank_name.encode())
     file_name = f"{hash_object.hexdigest()}_BIN.txt"
@@ -89,12 +197,23 @@ def save_matches_to_file(matches, bank_name):
             )
     return file_name
 def search_databin_by_bank_name(bank_name):
-    matches = []
-    with open('databin.csv', mode='r') as file:
-        csv_reader = csv.DictReader(file)
-        for row in csv_reader:
-            if re.search(bank_name, row['bank_name'], re.IGNORECASE):
-                matches.append(row)
+    """
+    Search merged local BIN dataset by bank name regex (case-insensitive).
+    """
+    if bin_data.empty:
+        return []
+
+    pattern = re.compile(bank_name, re.IGNORECASE)
+    matches: list[dict] = []
+
+    # Iterate rows for regex matching (pandas .str.contains can choke on bad regex)
+    for row in bin_data.to_dict(orient="records"):
+        bank = str(row.get("bank_name", ""))
+        if pattern.search(bank):
+            if "number" in row and row["number"] is not None:
+                row["number"] = int(row["number"])
+            matches.append(row)
+
     return matches
 def format_message(matches):
     message = ""
@@ -336,19 +455,20 @@ def bin_lookup_pro(bin_number):
 
 
 def get_user_role(user_id):
-
-    user_roles = fetch_sql("SELECT USERID,  Premium, VIP, Admin, Owner FROM users WHERE USERID = %s", (user_id,))
-
- 
+    user_roles = fetch_sql(
+        "SELECT premium, vip, admin, owner FROM users WHERE userid = %s",
+        (user_id,),
+    )
 
     if user_roles:
-        if user_roles[3]:  # Owner
+        premium, vip, admin, owner = user_roles
+        if owner:
             return "Owner"
-        elif user_roles[2]:  # Admin
+        if admin:
             return "Admin"
-        elif user_roles[1]:  # VIP
+        if vip:
             return "VIP"
-        elif user_roles[0]:  # Premium
+        if premium:
             return "Premium"
     return "Free User"
 
@@ -381,7 +501,7 @@ def update_user_setting(user_id, setting_name, value):
 @bot.on_message(filters.text & ~filters.command("register") & ~filters.command("info"))
 async def default_handler(client, message):
     user_id = message.from_user.id
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -607,7 +727,7 @@ async def bin_handler(client, message):
 
     # Create response message
     response_text = (
-        f"**BIN INFO | Database1 ✅**\n\n"
+        f"**BIN INFO | Local CSV (databin + databin2) ✅**\n\n"
         f"**Bank**: **{bin_info['bank_name']}** - **{bin_info['country']}{bin_info['flag']}**\n"
         f"**Info**: **{bin_info['vendor']}** **{bin_info['type']}** - **{bin_info['level']}**\n"
         f"**User**: <a href='tg://user?id={user_id}'>{user_first_name}</a> {role}\n"
@@ -622,14 +742,14 @@ async def register_handler(client, message):
     user_first_name = message.from_user.first_name
 
     # Check if the user is already registered
-    existing_user = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    existing_user = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
     if existing_user:
         return await message.reply_text("🚫 You are already registered.")
 
     # Register the new user in the users table
     execute_sql(
-        "INSERT INTO users (USERID,  Premium, VIP, Admin, Owner) VALUES (%s, %s, FALSE, FALSE, FALSE, FALSE);",
-        (user_id, user_first_name)
+        "INSERT INTO users (userid, first_name) VALUES (%s, %s);",
+        (user_id, user_first_name),
     )
 
     # Initialize user settings in the user_settings table with all False
@@ -646,7 +766,10 @@ async def register_handler(client, message):
 @bot.on_message(filters.command("info"))
 async def info_handler(client, message):
     user_id = message.from_user.id
-    users = fetch_sql("SELECT USERID,  Premium, VIP, Admin, Owner FROM users WHERE USERID = %s", (user_id,))
+    users = fetch_sql(
+        "SELECT userid, first_name, premium, vip, admin, owner FROM users WHERE userid = %s",
+        (user_id,),
+    )
 
     if users:
         _, first_name, premium, vip, admin, owner = users
@@ -717,6 +840,10 @@ def process_request(bot_client, message, bin_digit, limit):
     start_time = time.time()
     stop_event = Event()
 
+    search_key = (int(message.chat.id), int(message.from_user.id))
+    with ACTIVE_SEARCHES_LOCK:
+        ACTIVE_SEARCHES[search_key] = stop_event
+
     def search_messages():
         nonlocal total_found
         for dialog in app.get_dialogs():  # Use the app client for getting dialogs
@@ -774,14 +901,18 @@ Elapsed Time: {int(elapsed_time)}s
             if limit and total_found >= limit:
                 break
 
-    search_thread = Thread(target=search_messages)
-    search_thread.start()
+    try:
+        search_thread = Thread(target=search_messages)
+        search_thread.start()
 
-    update_thread = Thread(target=update_status)
-    update_thread.start()
+        update_thread = Thread(target=update_status)
+        update_thread.start()
 
-    search_thread.join()
-    update_thread.join()
+        search_thread.join()
+        update_thread.join()
+    finally:
+        with ACTIVE_SEARCHES_LOCK:
+            ACTIVE_SEARCHES.pop(search_key, None)
 
     finish_reason = "Time Limit Reached" if time.time() - start_time > 300 else "Stopped by User"
 
@@ -805,13 +936,28 @@ FINISHED. Reason: {finish_reason}
         bot_client.send_message(message.chat.id, f"No matches found for BIN {bin_digit}.")
 
 def stop_search(client, callback_query):
-    user_id = int(callback_query.data.split('_')[2])
-    if callback_query.from_user.id == user_id or callback_query.from_user.id in admin_ids:
-        stop_event.set()
-        callback_query.message.edit_text("Search stopped.")
-        client.answer_callback_query(callback_query.id, "Search stopped.")
-    else:
-        client.answer_callback_query(callback_query.id, "You are not authorized to stop this search.", show_alert=True)
+    parts = callback_query.data.split('_')
+    chat_id = int(parts[1])
+    target_user_id = int(parts[2])
+
+    if callback_query.from_user.id != target_user_id and callback_query.from_user.id not in admin_ids:
+        client.answer_callback_query(
+            callback_query.id,
+            "You are not authorized to stop this search.",
+            show_alert=True,
+        )
+        return
+
+    with ACTIVE_SEARCHES_LOCK:
+        event = ACTIVE_SEARCHES.get((chat_id, target_user_id))
+
+    if not event:
+        client.answer_callback_query(callback_query.id, "No active search to stop.", show_alert=True)
+        return
+
+    event.set()
+    callback_query.message.edit_text("Search stopped.")
+    client.answer_callback_query(callback_query.id, "Search stopped.")
 
 @bot.on_callback_query(filters.regex(r"^stop_\d+_\d+$"))
 def on_stop_button(bot_client, callback_query):
@@ -918,7 +1064,7 @@ def toggle_or_close_setting(bot_client, query: CallbackQuery):
 async def sbin_command(client, message):
     user_id = message.from_user.id
     user_role = get_user_role(user_id)
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -930,8 +1076,15 @@ async def sbin_command(client, message):
         )
         return
 
-    bin_number = message.text.split()[1]
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/sbin <BIN>`")
+        return
+
+    bin_number = message.command[1]
     bin_info = bin_lookup(bin_number)
+    if not bin_info:
+        await message.reply_text("🚫 BIN not found in local database.")
+        return
     bank_name = bin_info['bank_name']
 
     matches = search_databin(bank_name)
@@ -965,7 +1118,7 @@ async def abs_command(client, message):
     user_id = message.from_user.id
     user_role = get_user_role(user_id)
     
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -977,8 +1130,15 @@ async def abs_command(client, message):
         )
         return
 
-    bin_number = message.text.split()[1]
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/abs <BIN>`")
+        return
+
+    bin_number = message.command[1]
     bin_info = bin_lookup(bin_number)
+    if not bin_info:
+        await message.reply_text("🚫 BIN not found in local database.")
+        return
     settings = get_user_settings(user_id)
 
     setting_value_map = {
@@ -1028,7 +1188,7 @@ async def abs_command(client, message):
 async def bbs_command(client, message):
     user_id = message.from_user.id
     user_role = get_user_role(user_id)
-    user_registered = fetch_sql("SELECT USERID FROM users WHERE USERID = %s", (user_id,))
+    user_registered = fetch_sql("SELECT userid FROM users WHERE userid = %s", (user_id,))
 
     if not user_registered:
         await message.reply_text("🚫 You are not registered. Please use the /register command to register.")
@@ -1040,7 +1200,11 @@ async def bbs_command(client, message):
         )
         return
 
-    bank_name_input = " ".join(message.text.split()[1:])
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/bbs <bank name>`")
+        return
+
+    bank_name_input = " ".join(message.command[1:])
     matches = search_databin_by_bank_name(bank_name_input)
 
     if len(matches) > 5:
@@ -1309,7 +1473,7 @@ async def binpro_handler(client, message):
 @bot.on_message(filters.command("bank"))
 async def bank_handler(client, message):
     user_id = message.from_user.id
-    query = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else None
+    query = " ".join(message.command[1:]) if len(message.command) > 1 else None
     
     if not query:
         await message.reply_text("❓ *Please provide a bank name to search.*")
@@ -1327,15 +1491,18 @@ async def bank_handler(client, message):
     user_settings[user_id] = {
         'step': 'bank',
         'banks': banks,
+        'tokens': {},
         'time': datetime.now() + timedelta(minutes=30)
     }
     
     if len(banks) == 0:
         await message.reply_text(f"🚫 *No results found for* `{query}`")
     elif len(banks) <= 6:
-        inline_buttons = [
-            [InlineKeyboardButton(f"🏦 {bank}", callback_data=f"bank_{generate_random_string()}")] for bank in banks
-        ]
+        inline_buttons = []
+        for bank in banks:
+            token = generate_random_string(12)
+            user_settings[user_id]['tokens'][token] = {'bank': bank}
+            inline_buttons.append([InlineKeyboardButton(f"🏦 {bank}", callback_data=f"bank_{token}")])
         await message.reply_text(
             f"🔍 *Select the bank you're interested in:*",
             reply_markup=InlineKeyboardMarkup(inline_buttons)
@@ -1360,24 +1527,33 @@ async def bank_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    # Since the callback data is random, we'll retrieve the bank name from user settings
-    bank_name = next(bank for bank in user_settings[user_id]['banks'] if f"bank_{callback_query.data.split('_')[1]}" in callback_query.data)
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'bank' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    bank_name = token_data['bank']
     
     # Update user settings
     user_settings[user_id].update({
         'step': 'country',
         'selected_bank': bank_name
     })
+    user_settings[user_id]['tokens'] = {}
     
     results = search_databin_by_bank_name(bank_name)
     
     # Remove duplicate countries
     countries = remove_duplicates(results, key=lambda x: x['country'])
     
-    country_buttons = [
-        [InlineKeyboardButton(f"{row['flag']} {row['country']}", callback_data=f"country_{generate_random_string()}_{row['country']}_{bank_name}")]
-        for row in countries
-    ]
+    country_buttons = []
+    for row in countries:
+        token2 = generate_random_string(12)
+        user_settings[user_id]['tokens'][token2] = {
+            'country': row.get('country', ''),
+            'flag': row.get('flag', ''),
+        }
+        country_buttons.append([InlineKeyboardButton(f"{row.get('flag', '')} {row.get('country', '')}", callback_data=f"country_{token2}")])
     
     await callback_query.message.edit_text(
         f"🏦 *Bank:* `{bank_name}`\n🌍 *Select a country:*",
@@ -1392,25 +1568,34 @@ async def country_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    data = callback_query.data.split("_")
-    country = data[2]
-    bank_name = data[3]
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'country' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    country = token_data['country']
+    bank_name = user_settings[user_id].get('selected_bank')
+    if not bank_name:
+        await callback_query.answer("❌ Missing bank selection. Please start again.", show_alert=True)
+        return
     
     # Update user settings
     user_settings[user_id].update({
         'step': 'type',
         'selected_country': country
     })
+    user_settings[user_id]['tokens'] = {}
     
     results = search_databin_by_bank_name(bank_name)
     
     # Remove duplicate types
     types = remove_duplicates([row for row in results if row['country'] == country], key=lambda x: x['type'])
     
-    type_buttons = [
-        [InlineKeyboardButton(f"⚔️ {row['type']}", callback_data=f"type_{user_id}_{generate_random_string()}_{row['type']}_{bank_name}_{country}")]
-        for row in types
-    ]
+    type_buttons = []
+    for row in types:
+        token2 = generate_random_string(12)
+        user_settings[user_id]['tokens'][token2] = {'type': row.get('type', '')}
+        type_buttons.append([InlineKeyboardButton(f"⚔️ {row.get('type', '')}", callback_data=f"type_{token2}")])
     
     await callback_query.message.edit_text(
         f"🏦 *Bank:* `{bank_name}`\n🌍 *Country:* `{country}`\n⚙️ *Select a type:*",
@@ -1426,26 +1611,35 @@ async def type_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    data = callback_query.data.split("_")
-    type_name = data[3]
-    bank_name = data[4]
-    country = data[5]
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'type' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    type_name = token_data['type']
+    bank_name = user_settings[user_id].get('selected_bank')
+    country = user_settings[user_id].get('selected_country')
+    if not bank_name or not country:
+        await callback_query.answer("❌ Missing selection context. Please start again.", show_alert=True)
+        return
     
     # Update user settings
     user_settings[user_id].update({
         'step': 'vendor',
         'selected_type': type_name
     })
+    user_settings[user_id]['tokens'] = {}
     
     results = search_databin_by_bank_name(bank_name)
     
     # Remove duplicate vendors
     vendors = remove_duplicates([row for row in results if row['country'] == country and row['type'] == type_name], key=lambda x: x['vendor'])
     
-    vendor_buttons = [
-        [InlineKeyboardButton(f"💳 {vendor}", callback_data=f"vendor_{user_id}_{generate_random_string()}_{vendor}_{bank_name}_{country}_{type_name}")]
-        for vendor in vendors
-    ]
+    vendor_buttons = []
+    for vendor in vendors:
+        token2 = generate_random_string(12)
+        user_settings[user_id]['tokens'][token2] = {'vendor': vendor}
+        vendor_buttons.append([InlineKeyboardButton(f"💳 {vendor}", callback_data=f"vendor_{token2}")])
     
     await callback_query.message.edit_text(
         f"🏦 *Bank:* `{bank_name}`\n🌍 *Country:* `{country}`\n⚙️ *Type:* `{type_name}`\n💳 *Select a vendor:*",
@@ -1462,11 +1656,18 @@ async def vendor_callback(client, callback_query):
         await callback_query.answer("❌ This action is no longer available. Please start again.", show_alert=True)
         return
     
-    data = callback_query.data.split("_")
-    vendor = data[3]
-    bank_name = data[4]
-    country = data[5]
-    type_name = data[6]
+    token = callback_query.data.split('_', 1)[1]
+    token_data = user_settings[user_id].get('tokens', {}).get(token)
+    if not token_data or 'vendor' not in token_data:
+        await callback_query.answer("❌ Invalid selection. Please start again.", show_alert=True)
+        return
+    vendor = token_data['vendor']
+    bank_name = user_settings[user_id].get('selected_bank')
+    country = user_settings[user_id].get('selected_country')
+    type_name = user_settings[user_id].get('selected_type')
+    if not bank_name or not country or not type_name:
+        await callback_query.answer("❌ Missing selection context. Please start again.", show_alert=True)
+        return
     
     results = [row for row in search_databin_by_bank_name(bank_name) if row['country'] == country and row['type'] == type_name and row['vendor'] == vendor]
     
